@@ -1,0 +1,210 @@
+---
+title: "Random forest"
+format: html
+---
+
+# Setup  
+```{r}
+#| message: false
+#| warning: false
+
+library(tidymodels)
+library(tidyverse)
+library(vip)
+library(finetune)
+library(xgboost)
+```
+
+
+```{r weather}
+weather <- read_csv("../data/weather_monthsum.csv")
+
+weather
+```
+
+# ML workflow  
+We're going to use the same workflow as we used for elastic net.   
+
+## 1. Pre-processing  
+Here's where we perform **data split** and **data processing**.  
+
+### a. Data split  
+For data split, let's use **70% training / 30% testing**.
+
+```{r weather_split}
+# Setting seed to get reproducible results  
+set.seed(931735)
+
+# Setting split level  
+weather_split <- initial_split(weather, 
+                               prop = .7)
+
+weather_split
+```
+
+
+```{r weather_train}
+# Setting train set 
+weather_train <- training(weather_split)
+
+weather_train
+```
+How many observations?
+
+```{r weather_test}
+# Setting test split
+weather_test <- testing(weather_split)
+
+weather_test
+```
+How many observations?  
+
+Now, we put our **test set** aside and continue with our **train set** for training.  
+
+  
+### b. Data processing  
+
+```{r weather_recipe}
+weather_recipe <-
+  # Defining predicted and predictor variables
+  recipe(strength_gtex ~ .,
+         data = weather_train) %>%
+  # Removing year and site  
+    step_rm(year, site, matches("Jan|Feb|Mar|Apr|Nov|Dec")) 
+#%>%
+#  step_naomit()
+  # Normalizing all numeric variables except predicted variable
+  #step_normalize(all_numeric(), -all_outcomes())
+
+weather_recipe
+```
+
+Now that we have our recipe ready, we **need to apply it** to the training data in a process called prepping:
+
+```{r weather_prep}
+weather_prep <- weather_recipe %>%
+  prep()
+
+weather_prep
+```
+
+## 2. Training  
+### a. Model specification  
+  
+```{r xgb_spec}
+set.seed(123)
+xgb_spec  <- boost_tree(
+  trees = 1000,
+  tree_depth = tune(), min_n = tune(),
+  loss_reduction = tune(),                     ## first three: model complexity
+  sample_size = tune(), mtry = tune(),         ## randomness
+  learn_rate = tune()                          ## step size
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("regression")
+
+xgb_spec
+```
+
+
+Let's define our resampling strategy below, using a 5-fold cross validation approach:  
+```{r resampling_foldcv}
+set.seed(34549)
+resampling_foldcv <- vfold_cv(weather_train, 
+                              v = 5)
+```
+
+## Grid
+
+```{r}
+xgb_grid <- grid_latin_hypercube(
+  tree_depth(),
+  min_n(),
+  loss_reduction(),
+  sample_size = sample_prop(),
+  finalize(mtry(), resampling_foldcv),
+  learn_rate(),
+  size = 30
+)
+
+xgb_grid
+```
+
+## Workflow
+```{r}
+xgb_wf <- workflow() %>%
+  add_formula(strength_gtex ~ .) %>%
+  add_model(xgb_spec)
+
+xgb_wf
+```
+
+## Grid result
+```{r}
+doParallel::registerDoParallel()
+set.seed(76544)
+xgb_res <- tune_grid(
+  xgb_wf,
+  preprocessor = weather_recipe, 
+  resamples = resampling_foldcv,
+  grid = xgb_grid,
+  control = control_grid(save_pred = TRUE)
+)
+
+xgb_res
+
+best_auc <- select_best(xgb_res, metric = "rsq")
+```
+
+## Final xgb
+```{r}
+final_xgb <- finalize_workflow(
+  xgb_wf,
+  best_auc
+)
+```
+
+## Final res
+```{r final_spec}
+final_res <- last_fit(final_xgb, 
+                      weather_split)
+  
+final_res %>% 
+  collect_metrics()
+```
+
+## Predictions
+```{r}
+final_res %>% 
+  collect_predictions()
+```
+
+## Plot 1
+```{r}
+final_res %>%
+  collect_predictions() %>%
+  ggplot(aes(x = strength_gtex,
+             y = .pred)) +
+  geom_point() +
+  geom_abline() +
+  geom_smooth(method = "lm") +
+  scale_x_continuous(limits = c(20, 40)) +
+  scale_y_continuous(limits = c(20, 40))
+```
+
+## Plot 2
+```{r}
+final_res %>%
+  collect_predictions() %>%
+  metrica::scatter_plot(obs = strength_gtex,
+                        pred = .pred,
+                        print_eq = T,
+                        print_metrics = T,
+                        metrics_list = c("R2", "RMSE"),
+                      # Customize metrics position
+                        position_metrics = c(x=32,y=24),
+                        position_eq = c(x=32, y =26))+
+  labs(title = "XGBoost")
+
+
+```
